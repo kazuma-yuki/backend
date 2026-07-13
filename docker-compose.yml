@@ -18,6 +18,8 @@ services:
       POSTGRES_USER: garage
       POSTGRES_PASSWORD: ayambakar123
       POSTGRES_DB: garage_pi
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:

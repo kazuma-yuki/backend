@@ -1,3 +1,4 @@
+
 from dotenv import load_dotenv
 load_dotenv()
 import os
@@ -65,10 +66,15 @@ def send_otp(body: dict):
         msg["From"] = SMTP_FROM
         msg["To"] = to_email
         msg.attach(MIMEText(html_body, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo(); server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, to_email, msg.as_string())
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, to_email, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.ehlo(); server.starttls(); server.ehlo()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, to_email, msg.as_string())
         return {"success": True}
     except smtplib.SMTPAuthenticationError:
         raise HTTPException(status_code=500, detail="Autentikasi SMTP gagal.")
@@ -265,39 +271,6 @@ def delete_jasa_cat_job(id: int, db: Session = Depends(get_db)):
     db.delete(j); db.commit()
     return {"message": "deleted"}
 
-
-# =========================
-# PAINT BATCHES
-# =========================
-@app.get("/paint-batches")
-def get_paint_batches(db: Session = Depends(get_db)):
-    return [{"id": str(p.id), "name": p.name, "cost": p.cost, "remainingUses": p.remainingUses}
-            for p in db.query(models.PaintBatch).all()]
-
-@app.post("/paint-batches")
-def add_paint_batch(body: dict, db: Session = Depends(get_db)):
-    p = models.PaintBatch(name=body.get("name", "Batch Cat"),
-                          cost=float(body.get("cost", 0)),
-                          remainingUses=int(body.get("remainingUses", 4)))
-    db.add(p); db.commit(); db.refresh(p)
-    return {"id": str(p.id), **body}
-
-@app.put("/paint-batches/{id}")
-def update_paint_batch(id: int, body: dict, db: Session = Depends(get_db)):
-    p = db.query(models.PaintBatch).filter(models.PaintBatch.id == id).first()
-    if not p: raise HTTPException(status_code=404, detail="Batch tidak ditemukan")
-    p.name = body.get("name", p.name)
-    p.cost = float(body.get("cost", p.cost))
-    p.remainingUses = int(body.get("remainingUses", p.remainingUses))
-    db.commit(); db.refresh(p)
-    return {"id": str(p.id), **body}
-
-@app.delete("/paint-batches/{id}")
-def delete_paint_batch(id: int, db: Session = Depends(get_db)):
-    p = db.query(models.PaintBatch).filter(models.PaintBatch.id == id).first()
-    if not p: raise HTTPException(status_code=404, detail="Batch tidak ditemukan")
-    db.delete(p); db.commit()
-    return {"message": "deleted"}
 
 
 # =========================

@@ -12,6 +12,9 @@ import smtplib
 import os
 import json
 import socket
+import secrets
+import time
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -50,13 +53,22 @@ SMTP_USER     = os.getenv("SMTP_USER",     "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM     = os.getenv("SMTP_FROM",     SMTP_USER)
 
-@app.post("/send-otp")
-def send_otp(body: dict):
-    to_email = body.get("to_email", "").strip()
-    to_name  = body.get("to_name", "Pengguna")
-    otp_code = body.get("otp_code", "")
-    if not to_email or not otp_code:
-        raise HTTPException(status_code=400, detail="to_email dan otp_code wajib diisi")
+# --- Penyimpanan sementara di server (in-memory) ---
+# Login yang menunggu verifikasi OTP:
+#   { token: {"user_id": int, "otp": str, "expires": float, "attempts": int} }
+_PENDING_LOGINS: dict = {}
+# Session aktif setelah OTP terverifikasi: { session_token: user_id }
+_SESSIONS: dict = {}
+_auth_lock = threading.Lock()
+
+OTP_TTL_SECONDS  = 5 * 60   # OTP berlaku 5 menit
+OTP_MAX_ATTEMPTS = 5        # maksimal percobaan OTP salah per sesi login
+
+
+def _send_otp_email(to_email: str, to_name: str, otp_code: str):
+    """Kirim email OTP dari sisi server. Raise HTTPException bila gagal."""
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Email pengguna belum diatur, hubungi admin.")
     html_body = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;
                 border:1px solid #e5e7eb;border-radius:12px;">
@@ -83,11 +95,225 @@ def send_otp(body: dict):
                 server.ehlo(); server.starttls(); server.ehlo()
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_FROM, to_email, msg.as_string())
-        return {"success": True}
     except smtplib.SMTPAuthenticationError:
         raise HTTPException(status_code=500, detail="Autentikasi SMTP gagal.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal kirim email: {str(e)}")
+
+
+def _mask_email(email: str) -> str:
+    """Samarkan email untuk ditampilkan di halaman OTP, mis. a****z@gmail.com."""
+    if not email or "@" not in email:
+        return ""
+    name, domain = email.split("@", 1)
+    if len(name) <= 2:
+        masked = (name[0] if name else "") + "*"
+    else:
+        masked = name[0] + ("*" * (len(name) - 2)) + name[-1]
+    return f"{masked}@{domain}"
+
+
+def _new_otp() -> str:
+    """OTP 6 digit, digenerate di server."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+# =========================
+# AUTH (login + OTP di server)
+# =========================
+@app.post("/login")
+def login(body: dict, db: Session = Depends(get_db)):
+    """Langkah 1: validasi username & password, lalu kirim OTP dari server.
+    Client hanya menerima token + data minimal, TIDAK menerima OTP/password."""
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username dan password wajib diisi.")
+
+    user = db.query(models.User).filter(models.User.username == username).first()
+    # Pesan sengaja disamakan supaya tidak membocorkan apakah username terdaftar.
+    if not user or user.password != password:
+        raise HTTPException(status_code=401, detail="Username atau password salah.")
+
+    otp_code = _new_otp()
+    token = secrets.token_urlsafe(32)
+    with _auth_lock:
+        _PENDING_LOGINS[token] = {
+            "user_id": user.id,
+            "otp": otp_code,
+            "expires": time.time() + OTP_TTL_SECONDS,
+            "attempts": 0,
+        }
+    # OTP dikirim dari server; kalau email gagal, batalkan sesi login.
+    try:
+        _send_otp_email(user.email, user.name or user.username, otp_code)
+    except HTTPException:
+        with _auth_lock:
+            _PENDING_LOGINS.pop(token, None)
+        raise
+
+    # Hanya 1 blok minimal — tanpa password, tanpa OTP.
+    return {"token": token, "username": user.username, "email": _mask_email(user.email)}
+
+
+@app.post("/resend-otp")
+def resend_otp(body: dict, db: Session = Depends(get_db)):
+    """Kirim ulang OTP untuk sesi login yang sedang menunggu verifikasi."""
+    token = body.get("token") or ""
+    with _auth_lock:
+        pending = _PENDING_LOGINS.get(token)
+        if not pending:
+            raise HTTPException(status_code=400, detail="Sesi login tidak valid. Silakan login ulang.")
+        otp_code = _new_otp()
+        pending["otp"] = otp_code
+        pending["expires"] = time.time() + OTP_TTL_SECONDS
+        pending["attempts"] = 0
+        user_id = pending["user_id"]
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Pengguna tidak ditemukan.")
+    _send_otp_email(user.email, user.name or user.username, otp_code)
+    return {"success": True}
+
+
+@app.post("/verify-otp")
+def verify_otp(body: dict, db: Session = Depends(get_db)):
+    """Langkah 2: verifikasi OTP di server. Client cukup kirim token + otp."""
+    token = body.get("token") or ""
+    otp_input = (body.get("otp") or "").strip()
+    with _auth_lock:
+        pending = _PENDING_LOGINS.get(token)
+        if not pending:
+            raise HTTPException(status_code=400, detail="Sesi login tidak valid. Silakan login ulang.")
+        if time.time() > pending["expires"]:
+            _PENDING_LOGINS.pop(token, None)
+            raise HTTPException(status_code=400, detail="Kode OTP kedaluwarsa. Silakan login ulang.")
+        if pending["attempts"] >= OTP_MAX_ATTEMPTS:
+            _PENDING_LOGINS.pop(token, None)
+            raise HTTPException(status_code=429, detail="Terlalu banyak percobaan. Silakan login ulang.")
+        if otp_input != pending["otp"]:
+            pending["attempts"] += 1
+            raise HTTPException(status_code=401, detail="Kode OTP salah.")
+        # OTP benar → buat session, hapus pending.
+        user_id = pending["user_id"]
+        _PENDING_LOGINS.pop(token, None)
+        session_token = secrets.token_urlsafe(32)
+        _SESSIONS[session_token] = user_id
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Pengguna tidak ditemukan.")
+    return {
+        "sessionToken": session_token,
+        "user": {
+            "id": str(user.id),
+            "username": user.username,
+            "name": user.name,
+            "role": user.role,
+            "email": user.email,
+        },
+    }
+
+
+# =========================
+# LUPA SANDI (reset password via OTP, semua di server)
+# =========================
+_PENDING_RESETS: dict = {}   # { token: {"user_id","otp","expires","attempts"} }
+_RESET_TOKENS: dict = {}     # { reset_token: {"user_id","expires"} }
+
+
+@app.post("/forgot-password")
+def forgot_password(body: dict, db: Session = Depends(get_db)):
+    """Langkah 1: cari username, kirim OTP reset ke email dari server."""
+    username = (body.get("username") or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username wajib diisi.")
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Username tidak ditemukan.")
+    if not user.email:
+        raise HTTPException(status_code=400, detail="Akun ini tidak memiliki email terdaftar.")
+
+    otp_code = _new_otp()
+    token = secrets.token_urlsafe(32)
+    with _auth_lock:
+        _PENDING_RESETS[token] = {
+            "user_id": user.id, "otp": otp_code,
+            "expires": time.time() + OTP_TTL_SECONDS, "attempts": 0,
+        }
+    try:
+        _send_otp_email(user.email, user.name or user.username, otp_code)
+    except HTTPException:
+        with _auth_lock:
+            _PENDING_RESETS.pop(token, None)
+        raise
+    return {"token": token, "email": _mask_email(user.email)}
+
+
+@app.post("/forgot-password/resend")
+def forgot_password_resend(body: dict, db: Session = Depends(get_db)):
+    token = body.get("token") or ""
+    with _auth_lock:
+        pending = _PENDING_RESETS.get(token)
+        if not pending:
+            raise HTTPException(status_code=400, detail="Sesi tidak valid. Silakan ulangi.")
+        otp_code = _new_otp()
+        pending["otp"] = otp_code
+        pending["expires"] = time.time() + OTP_TTL_SECONDS
+        pending["attempts"] = 0
+        user_id = pending["user_id"]
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Pengguna tidak ditemukan.")
+    _send_otp_email(user.email, user.name or user.username, otp_code)
+    return {"success": True}
+
+
+@app.post("/forgot-password/verify")
+def forgot_password_verify(body: dict):
+    """Langkah 2: verifikasi OTP reset. Balikin resetToken (bukan langsung ganti password)."""
+    token = body.get("token") or ""
+    otp_input = (body.get("otp") or "").strip()
+    with _auth_lock:
+        pending = _PENDING_RESETS.get(token)
+        if not pending:
+            raise HTTPException(status_code=400, detail="Sesi tidak valid. Silakan ulangi.")
+        if time.time() > pending["expires"]:
+            _PENDING_RESETS.pop(token, None)
+            raise HTTPException(status_code=400, detail="Kode OTP kedaluwarsa. Silakan ulangi.")
+        if pending["attempts"] >= OTP_MAX_ATTEMPTS:
+            _PENDING_RESETS.pop(token, None)
+            raise HTTPException(status_code=429, detail="Terlalu banyak percobaan. Silakan ulangi.")
+        if otp_input != pending["otp"]:
+            pending["attempts"] += 1
+            raise HTTPException(status_code=401, detail="Kode OTP salah.")
+        user_id = pending["user_id"]
+        _PENDING_RESETS.pop(token, None)
+        reset_token = secrets.token_urlsafe(32)
+        _RESET_TOKENS[reset_token] = {"user_id": user_id, "expires": time.time() + OTP_TTL_SECONDS}
+    return {"resetToken": reset_token}
+
+
+@app.post("/forgot-password/reset")
+def forgot_password_reset(body: dict, db: Session = Depends(get_db)):
+    """Langkah 3: ganti password menggunakan resetToken yang sah."""
+    reset_token = body.get("resetToken") or ""
+    new_password = body.get("newPassword") or ""
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password minimal 6 karakter.")
+    with _auth_lock:
+        entry = _RESET_TOKENS.get(reset_token)
+        if not entry or time.time() > entry["expires"]:
+            _RESET_TOKENS.pop(reset_token, None)
+            raise HTTPException(status_code=400, detail="Sesi reset tidak valid atau kedaluwarsa. Silakan ulangi.")
+        user_id = entry["user_id"]
+        _RESET_TOKENS.pop(reset_token, None)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Pengguna tidak ditemukan.")
+    user.password = new_password
+    db.commit()
+    return {"success": True}
 
 
 # =========================

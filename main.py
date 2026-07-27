@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import os
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from database import engine, SessionLocal
 import models
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +26,29 @@ def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _getaddrinfo_ipv4
 
 models.Base.metadata.create_all(bind=engine)
+
+
+def _seed_default_users():
+    """Safety net: kalau tabel users kosong, buat akun default supaya tidak terkunci."""
+    db = SessionLocal()
+    try:
+        if db.query(models.User).count() == 0:
+            import datetime
+            now = datetime.datetime.utcnow().isoformat()
+            db.add_all([
+                models.User(username="admin", password="admin123", name="Administrator",
+                            role="admin", email="ggat.kasir1@yopmail.com", createdAt=now),
+                models.User(username="staff", password="staff123", name="Staff Bengkel",
+                            role="staff", email="ggat.kasir1@yopmail.com", createdAt=now),
+            ])
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+_seed_default_users()
 
 app = FastAPI()
 
@@ -116,6 +139,30 @@ def _mask_email(email: str) -> str:
 def _new_otp() -> str:
     """OTP 6 digit, digenerate di server."""
     return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def get_session_user(authorization: str = Header(default=""),
+                     db: Session = Depends(get_db)):
+    """Ambil user dari sessionToken (header: Authorization: Bearer <token>).
+    Sumber kebenaran otorisasi ada di server, bukan di localStorage client."""
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    with _auth_lock:
+        user_id = _SESSIONS.get(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Sesi tidak valid. Silakan login ulang.")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Sesi tidak valid. Silakan login ulang.")
+    return user
+
+
+def require_admin(user=Depends(get_session_user)):
+    """Role dicek di server, jadi tidak bisa dipalsukan lewat localStorage."""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Akses ditolak. Fitur ini khusus admin.")
+    return user
 
 
 # =========================
@@ -212,6 +259,19 @@ def verify_otp(body: dict, db: Session = Depends(get_db)):
             "role": user.role,
             "email": user.email,
         },
+    }
+
+
+@app.get("/me")
+def me(user=Depends(get_session_user)):
+    """Sumber kebenaran identitas & role pengguna yang sedang login.
+    Client wajib memanggil ini untuk menentukan hak akses, bukan localStorage."""
+    return {
+        "id": str(user.id),
+        "username": user.username,
+        "name": user.name,
+        "role": user.role,
+        "email": user.email,
     }
 
 
@@ -615,13 +675,13 @@ def delete_category(name: str, db: Session = Depends(get_db)):
 # USERS
 # =========================
 @app.get("/users")
-def get_users(db: Session = Depends(get_db)):
+def get_users(db: Session = Depends(get_db), _admin=Depends(require_admin)):
     return [{"id": str(u.id), "username": u.username, "password": u.password,
              "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}
             for u in db.query(models.User).all()]
 
 @app.post("/users")
-def add_user(body: dict, db: Session = Depends(get_db)):
+def add_user(body: dict, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     existing = db.query(models.User).filter(models.User.username == body.get("username")).first()
     if existing: raise HTTPException(status_code=400, detail="Username sudah dipakai")
     u = models.User(username=body.get("username"), password=body.get("password"),
@@ -632,7 +692,7 @@ def add_user(body: dict, db: Session = Depends(get_db)):
             "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}
 
 @app.put("/users/{id}")
-def update_user(id: int, body: dict, db: Session = Depends(get_db)):
+def update_user(id: int, body: dict, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     u = db.query(models.User).filter(models.User.id == id).first()
     if not u: raise HTTPException(status_code=404, detail="User tidak ditemukan")
     existing = db.query(models.User).filter(
@@ -648,7 +708,7 @@ def update_user(id: int, body: dict, db: Session = Depends(get_db)):
             "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}
 
 @app.delete("/users/{id}")
-def delete_user(id: int, db: Session = Depends(get_db)):
+def delete_user(id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     u = db.query(models.User).filter(models.User.id == id).first()
     if not u: raise HTTPException(status_code=404, detail="User tidak ditemukan")
     db.delete(u); db.commit()

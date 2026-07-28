@@ -508,7 +508,7 @@ def update_product(id: int, product: dict, db: Session = Depends(get_db), author
             _changes.append(f"{lbl} {_fmt_rp(_before[k])}→{_fmt_rp(nv)}"
                             if k in ("modalPrice", "sellPrice")
                             else f"{lbl} {_before[k]}→{nv}")
-    _desc = f"Ubah produk {db_product.name}" + (": " + ", ".join(_changes) if _changes else "")
+    _desc = f"Edit produk {db_product.name}" + (": " + ", ".join(_changes) if _changes else "")
     log_activity(db, resolve_actor(authorization, db), "update", "product", db_product.id, db_product.name, _desc)
     return db_product
 
@@ -663,7 +663,7 @@ def update_jasa_cat_job(id: int, body: dict, db: Session = Depends(get_db), auth
     if j.customer != _before["customer"]: _ch.append(f"customer {_before['customer']}→{j.customer}")
     if float(j.selling) != float(_before["selling"]): _ch.append(f"harga jual {_fmt_rp(_before['selling'])}→{_fmt_rp(j.selling)}")
     if float(j.cost) != float(_before["cost"]): _ch.append(f"modal {_fmt_rp(_before['cost'])}→{_fmt_rp(j.cost)}")
-    _desc = f"Ubah transaksi jasa servis {j.customer}" + (": " + ", ".join(_ch) if _ch else "")
+    _desc = f"Edit transaksi jasa servis {j.customer}" + (": " + ", ".join(_ch) if _ch else "")
     log_activity(db, resolve_actor(authorization, db), "update", "jasa_service", j.id, j.customer, _desc)
     return {"id": str(j.id), **body}
 
@@ -740,7 +740,7 @@ def update_service_type(id: str, body: dict, db: Session = Depends(get_db), auth
     _ch = []
     if s.name != _before_name: _ch.append(f"nama {_before_name}→{s.name}")
     if s.prices != _before_prices: _ch.append("harga diperbarui")
-    _desc = f"Ubah jenis service {s.name}" + (": " + ", ".join(_ch) if _ch else "")
+    _desc = f"Edit jenis service {s.name}" + (": " + ", ".join(_ch) if _ch else "")
     log_activity(db, resolve_actor(authorization, db), "update", "service_type", s.id, s.name, _desc)
     return {"id": s.id, "name": s.name, "color": s.color,
             "prices": json.loads(s.prices), "modal": json.loads(s.modal),
@@ -788,7 +788,7 @@ def update_category(name: str, body: dict, db: Session = Depends(get_db), author
     _ch = []
     if c.name != _before_name: _ch.append(f"nama {_before_name}→{c.name}")
     if c.color != _before_color: _ch.append(f"warna {_before_color}→{c.color}")
-    _desc = f"Ubah kategori {c.name}" + (": " + ", ".join(_ch) if _ch else "")
+    _desc = f"Edit kategori {c.name}" + (": " + ", ".join(_ch) if _ch else "")
     log_activity(db, resolve_actor(authorization, db), "update", "category", c.name, c.name, _desc)
     return {"name": c.name, "color": c.color}
 
@@ -848,7 +848,7 @@ def update_user(id: int, body: dict, db: Session = Depends(get_db), _admin=Depen
     if u.role != _before["role"]: _ch.append(f"role {_before['role']}→{u.role}")
     if u.email != _before["email"]: _ch.append("email diperbarui")
     if _pw_changed: _ch.append("password diubah")
-    _desc = f"Ubah pengguna {u.username}" + (": " + ", ".join(_ch) if _ch else "")
+    _desc = f"Edit pengguna {u.username}" + (": " + ", ".join(_ch) if _ch else "")
     log_activity(db, (str(_admin.id), _admin.username), "update", "user", u.id, u.username, _desc)
     return {"id": str(u.id), "username": u.username, "password": u.password,
             "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}

@@ -166,6 +166,62 @@ def require_admin(user=Depends(get_session_user)):
 
 
 # =========================
+# ACTIVITY LOG (riwayat aktivitas)
+# =========================
+def _fmt_rp(v) -> str:
+    try:
+        return "Rp" + f"{int(float(v)):,}".replace(",", ".")
+    except Exception:
+        return str(v)
+
+
+def resolve_actor(authorization: str, db: Session, fallback: str = "Sistem"):
+    """Tentukan pelaku dari sessionToken (server-side, tak bisa dipalsukan client)."""
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    with _auth_lock:
+        uid = _SESSIONS.get(token)
+    if uid:
+        u = db.query(models.User).filter(models.User.id == uid).first()
+        if u:
+            return str(u.id), u.username
+    return "", fallback
+
+
+def log_activity(db, actor, action, entity, entity_id, entity_name, description):
+    """Simpan satu baris riwayat. Tidak boleh mengganggu operasi utama bila gagal."""
+    try:
+        import datetime
+        actor_id, actor_name = actor
+        db.add(models.ActivityLog(
+            userId=actor_id or "",
+            username=actor_name or "Sistem",
+            action=action,
+            entity=entity,
+            entityId=str(entity_id or ""),
+            entityName=entity_name or "",
+            description=description or "",
+            createdAt=datetime.datetime.now().isoformat(timespec="seconds"),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@app.get("/activity-logs")
+def get_activity_logs(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    """Riwayat aktivitas, khusus admin. Terbaru di atas (maks 1000 baris)."""
+    rows = (db.query(models.ActivityLog)
+              .order_by(models.ActivityLog.id.desc())
+              .limit(1000).all())
+    return [{"id": str(r.id), "userId": r.userId, "username": r.username,
+             "action": r.action, "entity": r.entity, "entityId": r.entityId,
+             "entityName": r.entityName, "description": r.description,
+             "createdAt": r.createdAt} for r in rows]
+
+
+# =========================
 # AUTH (login + OTP di server)
 # =========================
 @app.post("/login")
@@ -388,13 +444,16 @@ def get_products(db: Session = Depends(get_db)):
             for p in db.query(models.Product).all()]
 
 @app.post("/products")
-def add_product(product: dict, db: Session = Depends(get_db)):
+def add_product(product: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     if not product.get("code"):
         import re, time
         base = re.sub(r'[^A-Z0-9]', '', product.get("name", "PROD").upper())[:6]
         product["code"] = f"{base}-{int(time.time()) % 100000}"
     new_product = models.Product(**product)
     db.add(new_product); db.commit(); db.refresh(new_product)
+    log_activity(db, resolve_actor(authorization, db), "create", "product",
+                 new_product.id, new_product.name,
+                 f"Tambah produk {new_product.name} (stok {new_product.stock}, jual {_fmt_rp(new_product.sellPrice)})")
     return new_product
 
 @app.put("/products/stock/{id}")
@@ -417,18 +476,32 @@ def update_availability(id: int, body: dict, db: Session = Depends(get_db)):
             "minStock": product.minStock, "unit": product.unit, "isAvailable": bool(product.isAvailable)}
 
 @app.put("/products/{id}")
-def update_product(id: int, product: dict, db: Session = Depends(get_db)):
+def update_product(id: int, product: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     db_product = db.query(models.Product).filter(models.Product.id == id).first()
     if not db_product: raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    _labels = {"name": "nama", "category": "kategori", "modalPrice": "harga modal",
+               "sellPrice": "harga jual", "stock": "stok", "minStock": "stok min", "unit": "satuan"}
+    _before = {k: getattr(db_product, k) for k in _labels}
     for key, value in product.items(): setattr(db_product, key, value)
     db.commit(); db.refresh(db_product)
+    _changes = []
+    for k, lbl in _labels.items():
+        if k in product and str(_before[k]) != str(getattr(db_product, k)):
+            nv = getattr(db_product, k)
+            _changes.append(f"{lbl} {_fmt_rp(_before[k])}→{_fmt_rp(nv)}"
+                            if k in ("modalPrice", "sellPrice")
+                            else f"{lbl} {_before[k]}→{nv}")
+    _desc = f"Ubah produk {db_product.name}" + (": " + ", ".join(_changes) if _changes else "")
+    log_activity(db, resolve_actor(authorization, db), "update", "product", db_product.id, db_product.name, _desc)
     return db_product
 
 @app.delete("/products/{id}")
-def delete_product(id: int, db: Session = Depends(get_db)):
+def delete_product(id: int, db: Session = Depends(get_db), authorization: str = Header(default="")):
     product = db.query(models.Product).filter(models.Product.id == id).first()
     if not product: raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    _name = product.name
     db.delete(product); db.commit()
+    log_activity(db, resolve_actor(authorization, db), "delete", "product", id, _name, f"Hapus produk {_name}")
     return {"message": "deleted"}
 
 
@@ -451,7 +524,7 @@ def get_transactions(db: Session = Depends(get_db)):
     return result
 
 @app.post("/transactions")
-def add_transaction(body: dict, db: Session = Depends(get_db)):
+def add_transaction(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     t = models.Transaction(
         invoiceNumber=body.get("invoiceNumber", ""),
         date=body.get("date", ""),
@@ -471,13 +544,19 @@ def add_transaction(body: dict, db: Session = Depends(get_db)):
         createdAt=body.get("createdAt", ""),
     )
     db.add(t); db.commit(); db.refresh(t)
+    log_activity(db, resolve_actor(authorization, db), "create", "transaction",
+                 t.id, t.invoiceNumber or t.customerName or str(t.id),
+                 f"Buat transaksi penjualan {t.invoiceNumber or ''} total {_fmt_rp(t.total)}".replace("  ", " ").strip())
     return {"id": str(t.id), **body}
 
 @app.delete("/transactions/{id}")
-def delete_transaction(id: int, db: Session = Depends(get_db)):
+def delete_transaction(id: int, db: Session = Depends(get_db), authorization: str = Header(default="")):
     t = db.query(models.Transaction).filter(models.Transaction.id == id).first()
     if not t: raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
+    _inv = t.invoiceNumber or str(id); _total = t.total
     db.delete(t); db.commit()
+    log_activity(db, resolve_actor(authorization, db), "delete", "transaction", id, _inv,
+                 f"Hapus transaksi {_inv} (total {_fmt_rp(_total)})")
     return {"message": "deleted"}
 
 
@@ -528,7 +607,7 @@ def get_jasa_cat_jobs(db: Session = Depends(get_db)):
             for j in db.query(models.JasaCatJob).order_by(models.JasaCatJob.createdAt.desc()).all()]
 
 @app.post("/jasa-cat-jobs")
-def add_jasa_cat_job(body: dict, db: Session = Depends(get_db)):
+def add_jasa_cat_job(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     j = models.JasaCatJob(
         date=body.get("date", body.get("tanggal", "")),
         customer=body.get("customer", body.get("customerName", body.get("namaCustomer", ""))),
@@ -541,12 +620,15 @@ def add_jasa_cat_job(body: dict, db: Session = Depends(get_db)):
         data=json.dumps(body),
     )
     db.add(j); db.commit(); db.refresh(j)
+    log_activity(db, resolve_actor(authorization, db), "create", "jasa_service",
+                 j.id, j.customer, f"Buat transaksi jasa servis {j.customer} ({_fmt_rp(j.selling)})")
     return {"id": str(j.id), **body}
 
 @app.put("/jasa-cat-jobs/{id}")
-def update_jasa_cat_job(id: int, body: dict, db: Session = Depends(get_db)):
+def update_jasa_cat_job(id: int, body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     j = db.query(models.JasaCatJob).filter(models.JasaCatJob.id == id).first()
     if not j: raise HTTPException(status_code=404, detail="Job tidak ditemukan")
+    _before = {"customer": j.customer, "selling": j.selling, "cost": j.cost}
     j.date = body.get("date", body.get("tanggal", j.date))
     j.customer = body.get("customer", body.get("customerName", j.customer))
     j.motorType = body.get("motorType", body.get("jenisMotor", j.motorType))
@@ -556,13 +638,22 @@ def update_jasa_cat_job(id: int, body: dict, db: Session = Depends(get_db)):
     j.notes = body.get("notes", j.notes)
     j.data = json.dumps(body)
     db.commit(); db.refresh(j)
+    _ch = []
+    if j.customer != _before["customer"]: _ch.append(f"customer {_before['customer']}→{j.customer}")
+    if float(j.selling) != float(_before["selling"]): _ch.append(f"harga jual {_fmt_rp(_before['selling'])}→{_fmt_rp(j.selling)}")
+    if float(j.cost) != float(_before["cost"]): _ch.append(f"modal {_fmt_rp(_before['cost'])}→{_fmt_rp(j.cost)}")
+    _desc = f"Ubah transaksi jasa servis {j.customer}" + (": " + ", ".join(_ch) if _ch else "")
+    log_activity(db, resolve_actor(authorization, db), "update", "jasa_service", j.id, j.customer, _desc)
     return {"id": str(j.id), **body}
 
 @app.delete("/jasa-cat-jobs/{id}")
-def delete_jasa_cat_job(id: int, db: Session = Depends(get_db)):
+def delete_jasa_cat_job(id: int, db: Session = Depends(get_db), authorization: str = Header(default="")):
     j = db.query(models.JasaCatJob).filter(models.JasaCatJob.id == id).first()
     if not j: raise HTTPException(status_code=404, detail="Job tidak ditemukan")
+    _name = j.customer
     db.delete(j); db.commit()
+    log_activity(db, resolve_actor(authorization, db), "delete", "jasa_service", id, _name,
+                 f"Hapus transaksi jasa servis {_name}")
     return {"message": "deleted"}
 
 
@@ -598,7 +689,7 @@ def get_service_types(db: Session = Depends(get_db)):
             for s in db.query(models.ServiceType).all()]
 
 @app.post("/service-types")
-def add_service_type(body: dict, db: Session = Depends(get_db)):
+def add_service_type(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     s = models.ServiceType(
         id=body.get("id", f"custom_{int(__import__('time').time()*1000)}"),
         name=body["name"],
@@ -608,29 +699,40 @@ def add_service_type(body: dict, db: Session = Depends(get_db)):
         linkedCategory=body.get("linkedCategory") or None,
     )
     db.add(s); db.commit(); db.refresh(s)
+    log_activity(db, resolve_actor(authorization, db), "create", "service_type", s.id, s.name,
+                 f"Tambah jenis service {s.name}")
     return {"id": s.id, "name": s.name, "color": s.color,
             "prices": json.loads(s.prices), "modal": json.loads(s.modal),
             "linkedCategory": s.linkedCategory}
 
 @app.put("/service-types/{id}")
-def update_service_type(id: str, body: dict, db: Session = Depends(get_db)):
+def update_service_type(id: str, body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     s = db.query(models.ServiceType).filter(models.ServiceType.id == id).first()
     if not s: raise HTTPException(status_code=404, detail="Service type tidak ditemukan")
+    _before_name, _before_prices = s.name, s.prices
     s.name = body.get("name", s.name)
     s.color = body.get("color", s.color)
     if "prices" in body: s.prices = json.dumps(body["prices"])
     if "modal" in body: s.modal = json.dumps(body["modal"])
     s.linkedCategory = body.get("linkedCategory") or None
     db.commit(); db.refresh(s)
+    _ch = []
+    if s.name != _before_name: _ch.append(f"nama {_before_name}→{s.name}")
+    if s.prices != _before_prices: _ch.append("harga diperbarui")
+    _desc = f"Ubah jenis service {s.name}" + (": " + ", ".join(_ch) if _ch else "")
+    log_activity(db, resolve_actor(authorization, db), "update", "service_type", s.id, s.name, _desc)
     return {"id": s.id, "name": s.name, "color": s.color,
             "prices": json.loads(s.prices), "modal": json.loads(s.modal),
             "linkedCategory": s.linkedCategory}
 
 @app.delete("/service-types/{id}")
-def delete_service_type(id: str, db: Session = Depends(get_db)):
+def delete_service_type(id: str, db: Session = Depends(get_db), authorization: str = Header(default="")):
     s = db.query(models.ServiceType).filter(models.ServiceType.id == id).first()
     if not s: raise HTTPException(status_code=404, detail="Service type tidak ditemukan")
+    _name = s.name
     db.delete(s); db.commit()
+    log_activity(db, resolve_actor(authorization, db), "delete", "service_type", id, _name,
+                 f"Hapus jenis service {_name}")
     return {"message": "deleted"}
 
 
@@ -643,31 +745,42 @@ def get_categories(db: Session = Depends(get_db)):
             for c in db.query(models.Category).order_by(models.Category.id).all()]
 
 @app.post("/categories")
-def add_category(body: dict, db: Session = Depends(get_db)):
+def add_category(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     existing = db.query(models.Category).filter(models.Category.name == body.get("name")).first()
     if existing: raise HTTPException(status_code=400, detail="Kategori sudah ada")
     c = models.Category(name=body.get("name", ""), color=body.get("color", "#14B8A6"))
     db.add(c); db.commit(); db.refresh(c)
+    log_activity(db, resolve_actor(authorization, db), "create", "category", c.name, c.name,
+                 f"Tambah kategori {c.name}")
     return {"name": c.name, "color": c.color}
 
 @app.put("/categories/{name:path}")
-def update_category(name: str, body: dict, db: Session = Depends(get_db)):
+def update_category(name: str, body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
     from urllib.parse import unquote
     name = unquote(name)
     c = db.query(models.Category).filter(models.Category.name == name).first()
     if not c: raise HTTPException(status_code=404, detail="Kategori tidak ditemukan")
+    _before_name, _before_color = c.name, c.color
     c.name = body.get("name", c.name)
     c.color = body.get("color", c.color)
     db.commit()
+    _ch = []
+    if c.name != _before_name: _ch.append(f"nama {_before_name}→{c.name}")
+    if c.color != _before_color: _ch.append(f"warna {_before_color}→{c.color}")
+    _desc = f"Ubah kategori {c.name}" + (": " + ", ".join(_ch) if _ch else "")
+    log_activity(db, resolve_actor(authorization, db), "update", "category", c.name, c.name, _desc)
     return {"name": c.name, "color": c.color}
 
 @app.delete("/categories/{name:path}")
-def delete_category(name: str, db: Session = Depends(get_db)):
+def delete_category(name: str, db: Session = Depends(get_db), authorization: str = Header(default="")):
     from urllib.parse import unquote
     name = unquote(name)
     c = db.query(models.Category).filter(models.Category.name == name).first()
     if not c: raise HTTPException(status_code=404, detail="Kategori tidak ditemukan")
+    _name = c.name
     db.delete(c); db.commit()
+    log_activity(db, resolve_actor(authorization, db), "delete", "category", _name, _name,
+                 f"Hapus kategori {_name}")
     return {"message": "deleted"}
 
 
@@ -688,6 +801,8 @@ def add_user(body: dict, db: Session = Depends(get_db), _admin=Depends(require_a
                     name=body.get("name"), role=body.get("role", "staff"),
                     email=body.get("email"), createdAt=body.get("createdAt", ""))
     db.add(u); db.commit(); db.refresh(u)
+    log_activity(db, (str(_admin.id), _admin.username), "create", "user", u.id, u.username,
+                 f"Tambah pengguna {u.username} (role {u.role})")
     return {"id": str(u.id), "username": u.username, "password": u.password,
             "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}
 
@@ -698,12 +813,22 @@ def update_user(id: int, body: dict, db: Session = Depends(get_db), _admin=Depen
     existing = db.query(models.User).filter(
         models.User.username == body.get("username"), models.User.id != id).first()
     if existing: raise HTTPException(status_code=400, detail="Username sudah dipakai")
+    _before = {"username": u.username, "name": u.name, "role": u.role, "email": u.email}
+    _pw_changed = bool(body.get("password"))
     u.username = body.get("username", u.username)
     u.name = body.get("name", u.name)
     u.role = body.get("role", u.role)
     u.email = body.get("email", u.email)
     if body.get("password"): u.password = body["password"]
     db.commit(); db.refresh(u)
+    _ch = []
+    if u.username != _before["username"]: _ch.append(f"username {_before['username']}→{u.username}")
+    if u.name != _before["name"]: _ch.append(f"nama {_before['name']}→{u.name}")
+    if u.role != _before["role"]: _ch.append(f"role {_before['role']}→{u.role}")
+    if u.email != _before["email"]: _ch.append("email diperbarui")
+    if _pw_changed: _ch.append("password diubah")
+    _desc = f"Ubah pengguna {u.username}" + (": " + ", ".join(_ch) if _ch else "")
+    log_activity(db, (str(_admin.id), _admin.username), "update", "user", u.id, u.username, _desc)
     return {"id": str(u.id), "username": u.username, "password": u.password,
             "name": u.name, "role": u.role, "email": u.email, "createdAt": u.createdAt}
 
@@ -711,5 +836,8 @@ def update_user(id: int, body: dict, db: Session = Depends(get_db), _admin=Depen
 def delete_user(id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     u = db.query(models.User).filter(models.User.id == id).first()
     if not u: raise HTTPException(status_code=404, detail="User tidak ditemukan")
+    _name = u.username
     db.delete(u); db.commit()
+    log_activity(db, (str(_admin.id), _admin.username), "delete", "user", id, _name,
+                 f"Hapus pengguna {_name}")
     return {"message": "deleted"}

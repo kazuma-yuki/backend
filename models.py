@@ -61,13 +61,6 @@ class JasaCatJob(Base):
     createdAt = Column(String)
     data = Column(Text)  # JSON lengkap asli
 
-class PaintBatch(Base):
-    __tablename__ = "paint_batches"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String)
-    cost = Column(Float, default=0)
-    remainingUses = Column(Integer, default=4)
-
 class Category(Base):
     __tablename__ = "categories"
     id = Column(Integer, primary_key=True, index=True)
@@ -92,3 +85,15 @@ class User(Base):
     role = Column(String, default="staff")
     email = Column(String)
     createdAt = Column(String)
+
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    userId = Column(String, default="")        # id pelaku
+    username = Column(String, default="")      # username pelaku (didenormalisasi)
+    action = Column(String)                    # create / update / delete
+    entity = Column(String)                    # product / transaction / category / service_type / jasa_service / user
+    entityId = Column(String, default="")      # id objek yang terpengaruh
+    entityName = Column(String, default="")    # nama/label objek
+    description = Column(Text, default="")     # ringkasan perubahan
+    createdAt = Column(String)                 # ISO timestamp (waktu server)

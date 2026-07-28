@@ -189,6 +189,21 @@ def resolve_actor(authorization: str, db: Session, fallback: str = "Sistem"):
     return "", fallback
 
 
+ACTIVITY_RETENTION_DAYS = 30  # riwayat hanya disimpan 1 bulan, selebihnya dihapus
+
+
+def _purge_old_logs(db):
+    """Hapus riwayat yang lebih tua dari batas retensi (1 bulan)."""
+    try:
+        import datetime
+        cutoff = (datetime.datetime.now()
+                  - datetime.timedelta(days=ACTIVITY_RETENTION_DAYS)).isoformat(timespec="seconds")
+        db.query(models.ActivityLog).filter(models.ActivityLog.createdAt < cutoff).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def log_activity(db, actor, action, entity, entity_id, entity_name, description):
     """Simpan satu baris riwayat. Tidak boleh mengganggu operasi utama bila gagal."""
     try:
@@ -205,13 +220,15 @@ def log_activity(db, actor, action, entity, entity_id, entity_name, description)
             createdAt=datetime.datetime.now().isoformat(timespec="seconds"),
         ))
         db.commit()
+        _purge_old_logs(db)
     except Exception:
         db.rollback()
 
 
 @app.get("/activity-logs")
 def get_activity_logs(db: Session = Depends(get_db), _admin=Depends(require_admin)):
-    """Riwayat aktivitas, khusus admin. Terbaru di atas (maks 1000 baris)."""
+    """Riwayat aktivitas, khusus admin. Hanya 1 bulan terakhir, terbaru di atas."""
+    _purge_old_logs(db)
     rows = (db.query(models.ActivityLog)
               .order_by(models.ActivityLog.id.desc())
               .limit(1000).all())
@@ -544,19 +561,23 @@ def add_transaction(body: dict, db: Session = Depends(get_db), authorization: st
         createdAt=body.get("createdAt", ""),
     )
     db.add(t); db.commit(); db.refresh(t)
+    _who = (f"No. HP {t.customerPhone}" if t.customerPhone
+            else (f"a.n. {t.customerName}" if t.customerName else f"#{t.id}"))
     log_activity(db, resolve_actor(authorization, db), "create", "transaction",
-                 t.id, t.invoiceNumber or t.customerName or str(t.id),
-                 f"Buat transaksi penjualan {t.invoiceNumber or ''} total {_fmt_rp(t.total)}".replace("  ", " ").strip())
+                 t.id, t.customerPhone or t.customerName or str(t.id),
+                 f"Buat transaksi penjualan {_who} total {_fmt_rp(t.total)}")
     return {"id": str(t.id), **body}
 
 @app.delete("/transactions/{id}")
 def delete_transaction(id: int, db: Session = Depends(get_db), authorization: str = Header(default="")):
     t = db.query(models.Transaction).filter(models.Transaction.id == id).first()
     if not t: raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
-    _inv = t.invoiceNumber or str(id); _total = t.total
+    _who = (f"No. HP {t.customerPhone}" if t.customerPhone
+            else (f"a.n. {t.customerName}" if t.customerName else f"#{id}"))
+    _ident = t.customerPhone or t.customerName or str(id); _total = t.total
     db.delete(t); db.commit()
-    log_activity(db, resolve_actor(authorization, db), "delete", "transaction", id, _inv,
-                 f"Hapus transaksi {_inv} (total {_fmt_rp(_total)})")
+    log_activity(db, resolve_actor(authorization, db), "delete", "transaction", id, _ident,
+                 f"Hapus transaksi penjualan {_who} (total {_fmt_rp(_total)})")
     return {"message": "deleted"}
 
 

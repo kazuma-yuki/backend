@@ -158,21 +158,6 @@ if table_exists(cursor, "jasa_cat_jobs"):
     pg_db.commit()
     print(f"✓ Jasa Cat Jobs: {count} baris dipindahkan (dari {len(rows)} total)")
 
-# ── 5. Paint Batches ───────────────────────────────────────────────────────────
-if table_exists(cursor, "paint_batches"):
-    rows = cursor.execute("SELECT * FROM paint_batches").fetchall()
-    count = 0
-    for r in rows:
-        exists = pg_db.query(models.PaintBatch).filter(models.PaintBatch.id == r["id"]).first()
-        if not exists:
-            pg_db.add(models.PaintBatch(
-                id=r["id"], name=r["name"],
-                cost=float(r["cost"] or 0),
-                remainingUses=int(r["remainingUses"] or 4),
-            ))
-            count += 1
-    pg_db.commit()
-    print(f"✓ Paint Batches: {count} baris dipindahkan (dari {len(rows)} total)")
 
 # ── 6. Categories ──────────────────────────────────────────────────────────────
 if table_exists(cursor, "categories"):
@@ -229,7 +214,6 @@ tables_with_int_pk = [
     ("transactions", "transactions_id_seq"),
     ("stock_movements", "stock_movements_id_seq"),
     ("jasa_cat_jobs", "jasa_cat_jobs_id_seq"),
-    ("paint_batches", "paint_batches_id_seq"),
     ("categories", "categories_id_seq"),
     ("users", "users_id_seq"),
 ]

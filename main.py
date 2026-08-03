@@ -13,6 +13,7 @@ import os
 import json
 import socket
 import secrets
+import datetime
 import time
 import threading
 from email.mime.text import MIMEText
@@ -25,6 +26,20 @@ def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 socket.getaddrinfo = _getaddrinfo_ipv4
 
+# =========================
+# WAKTU (WIB / Asia-Jakarta)
+# =========================
+# Server hosting berjalan pada UTC, sehingga datetime.now() menghasilkan waktu
+# yang tertinggal 7 jam dari waktu Indonesia Barat. Seluruh stempel waktu
+# dibuat eksplisit pada zona WIB agar konsisten di mana pun server dijalankan.
+WIB = datetime.timezone(datetime.timedelta(hours=7))
+
+
+def now_wib() -> str:
+    """Waktu WIB dalam format ISO tanpa akhiran zona, mis. 2026-08-03T23:16:00."""
+    return datetime.datetime.now(WIB).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
 models.Base.metadata.create_all(bind=engine)
 
 
@@ -33,8 +48,7 @@ def _seed_default_users():
     db = SessionLocal()
     try:
         if db.query(models.User).count() == 0:
-            import datetime
-            now = datetime.datetime.utcnow().isoformat()
+            now = now_wib()
             db.add_all([
                 models.User(username="admin", password="admin123", name="Administrator",
                             role="admin", email="ggat.kasir1@yopmail.com", createdAt=now),
@@ -49,6 +63,26 @@ def _seed_default_users():
 
 
 _seed_default_users()
+
+
+def _migrate_log_ubah_to_edit():
+    """Selaraskan riwayat lama: keterangan yang diawali 'Ubah ' menjadi 'Edit '.
+    Idempoten — aman dijalankan berkali-kali."""
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        db.execute(text(
+            "UPDATE activity_logs SET description = 'Edit ' || substr(description, 6) "
+            "WHERE description LIKE 'Ubah %'"
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+_migrate_log_ubah_to_edit()
 
 app = FastAPI()
 
@@ -166,6 +200,85 @@ def require_admin(user=Depends(get_session_user)):
 
 
 # =========================
+# VALIDASI NOMOR HANDPHONE (Indonesia)
+# =========================
+PHONE_MIN_LENGTH = 10
+PHONE_MAX_LENGTH = 13
+
+
+# Garage Garage Amat adalah bengkel skala kecil: stok tiap spare part <= 100 unit.
+MAX_STOCK = 100
+
+# Batas nominal tunai; bila total transaksi melebihi ini, batas mengikuti total
+# agar transaksi sah tidak terhalang.
+MAX_CASH_PAYMENT = 10_000_000
+
+
+def validate_stock_fields(product: dict) -> dict:
+    """Pastikan stok & stok minimum berupa bilangan bulat 0..MAX_STOCK.
+
+    Divalidasi di server agar batas tetap berlaku walau permintaan dikirim
+    langsung ke API tanpa melewati antarmuka.
+    """
+    for key, label in (("stock", "Stok"), ("minStock", "Stok minimum")):
+        if key not in product or product[key] is None or product[key] == "":
+            continue
+        try:
+            value = int(product[key])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{label} harus berupa angka bulat.")
+        if value < 0:
+            raise HTTPException(status_code=400, detail=f"{label} tidak boleh negatif.")
+        if value > MAX_STOCK:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} maksimal {MAX_STOCK:,} unit.".replace(",", "."))
+        product[key] = value
+    return product
+
+
+def validate_cash(paid, total) -> float:
+    """Pastikan uang tunai >= total dan tidak melebihi batas wajar."""
+    try:
+        paid = float(paid or 0)
+        total = float(total or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Nominal pembayaran tidak valid.")
+    if paid < total:
+        raise HTTPException(status_code=400, detail="Uang pembayaran kurang dari total belanja.")
+    limit = max(MAX_CASH_PAYMENT, total)
+    if paid > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uang dibayar maksimal Rp{limit:,.0f}.".replace(",", "."))
+    return paid
+
+
+def validate_phone(raw, field_name: str = "Nomor handphone") -> str:
+    """Validasi nomor seluler Indonesia: diawali 08, panjang 10-13 digit.
+
+    Divalidasi ulang di server agar tidak bisa ditembus lewat pemanggilan API
+    langsung meskipun validasi di sisi client sudah ada.
+    """
+    phone = "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+    if not phone:
+        raise HTTPException(status_code=400, detail=f"{field_name} wajib diisi.")
+    if not phone.startswith("08"):
+        raise HTTPException(status_code=400, detail=f"{field_name} harus diawali 08.")
+    if len(phone) < PHONE_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} minimal {PHONE_MIN_LENGTH} digit.")
+    if len(phone) > PHONE_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} maksimal {PHONE_MAX_LENGTH} digit.")
+
+    return phone
+
+
+# =========================
 # ACTIVITY LOG (riwayat aktivitas)
 # =========================
 def _fmt_rp(v) -> str:
@@ -196,7 +309,7 @@ def _purge_old_logs(db):
     """Hapus riwayat yang lebih tua dari batas retensi (1 bulan)."""
     try:
         import datetime
-        cutoff = (datetime.datetime.now()
+        cutoff = (datetime.datetime.now(WIB).replace(tzinfo=None)
                   - datetime.timedelta(days=ACTIVITY_RETENTION_DAYS)).isoformat(timespec="seconds")
         db.query(models.ActivityLog).filter(models.ActivityLog.createdAt < cutoff).delete(synchronize_session=False)
         db.commit()
@@ -207,7 +320,6 @@ def _purge_old_logs(db):
 def log_activity(db, actor, action, entity, entity_id, entity_name, description):
     """Simpan satu baris riwayat. Tidak boleh mengganggu operasi utama bila gagal."""
     try:
-        import datetime
         actor_id, actor_name = actor
         db.add(models.ActivityLog(
             userId=actor_id or "",
@@ -217,7 +329,7 @@ def log_activity(db, actor, action, entity, entity_id, entity_name, description)
             entityId=str(entity_id or ""),
             entityName=entity_name or "",
             description=description or "",
-            createdAt=datetime.datetime.now().isoformat(timespec="seconds"),
+            createdAt=now_wib(),
         ))
         db.commit()
         _purge_old_logs(db)
@@ -462,6 +574,7 @@ def get_products(db: Session = Depends(get_db)):
 
 @app.post("/products")
 def add_product(product: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
+    product = validate_stock_fields(product)
     if not product.get("code"):
         import re, time
         base = re.sub(r'[^A-Z0-9]', '', product.get("name", "PROD").upper())[:6]
@@ -478,6 +591,10 @@ def update_stock(id: int, quantity: int, db: Session = Depends(get_db)):
     product = db.query(models.Product).filter(models.Product.id == id).first()
     if not product: raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     if product.stock + quantity < 0: raise HTTPException(status_code=400, detail="Stok tidak cukup")
+    if product.stock + quantity > MAX_STOCK:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Stok maksimal {MAX_STOCK:,} unit.".replace(",", "."))
     product.stock += quantity
     db.commit(); db.refresh(product)
     return product
@@ -494,6 +611,7 @@ def update_availability(id: int, body: dict, db: Session = Depends(get_db)):
 
 @app.put("/products/{id}")
 def update_product(id: int, product: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
+    product = validate_stock_fields(product)
     db_product = db.query(models.Product).filter(models.Product.id == id).first()
     if not db_product: raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     _labels = {"name": "nama", "category": "kategori", "modalPrice": "harga modal",
@@ -542,6 +660,9 @@ def get_transactions(db: Session = Depends(get_db)):
 
 @app.post("/transactions")
 def add_transaction(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
+    body["customerPhone"] = validate_phone(body.get("customerPhone"))
+    if body.get("paymentMethod", "cash") == "cash":
+        body["uangBayar"] = validate_cash(body.get("uangBayar"), body.get("total"))
     t = models.Transaction(
         invoiceNumber=body.get("invoiceNumber", ""),
         date=body.get("date", ""),
@@ -629,6 +750,7 @@ def get_jasa_cat_jobs(db: Session = Depends(get_db)):
 
 @app.post("/jasa-cat-jobs")
 def add_jasa_cat_job(body: dict, db: Session = Depends(get_db), authorization: str = Header(default="")):
+    body["noHandphone"] = validate_phone(body.get("noHandphone"))
     j = models.JasaCatJob(
         date=body.get("date", body.get("tanggal", "")),
         customer=body.get("customer", body.get("customerName", body.get("namaCustomer", ""))),

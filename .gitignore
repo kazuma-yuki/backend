@@ -29,4 +29,6 @@ garage.db
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.dbgarage_backup.dump.sql
+*.dump.sql
+*.sql
